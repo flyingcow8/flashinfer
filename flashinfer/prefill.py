@@ -1438,6 +1438,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
         self._use_cuda_graph = use_cuda_graph
@@ -1504,6 +1505,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
 

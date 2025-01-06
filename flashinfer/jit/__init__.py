@@ -48,3 +48,5 @@ try:
     has_prebuilt_ops = True
 except ImportError:
     has_prebuilt_ops = False
+
+has_prebuilt_ops = True

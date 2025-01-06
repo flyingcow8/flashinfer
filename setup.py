@@ -42,9 +42,9 @@ allow_fp16_qk_reductions_sm90 = [mode for mode in allow_fp16_qk_reductions if mo
 mask_modes = list(map(int, mask_modes))
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
-enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
-enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
-enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
+enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "0") == "1"
+enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "0") == "1"
+enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "0") == "1"
 
 
 def get_version():
