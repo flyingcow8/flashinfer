@@ -27,7 +27,7 @@ import setuptools
 root = Path(__file__).parent.resolve()
 gen_dir = root / "csrc" / "generated"
 
-head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "128,256").split(",")
+head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "128").split(",")
 head_dims = list(map(int, head_dims))
 SM90_ALLOWED_HEAD_DIMS = {(64, 64), (128, 128), (256, 256), (192, 128)}
 head_dims_sm90 = [(d, d) for d in head_dims if (d, d) in SM90_ALLOWED_HEAD_DIMS]
@@ -40,15 +40,18 @@ mask_modes = [0, 1, 2]
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_f16 = os.environ.get("FLASHINFER_ENABLE_F16", "1") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
-enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
+enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "0"
 enable_fp8_e4m3 = (
     os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
 )
 enable_fp8_e5m2 = (
     os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
 )
-enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
-
+enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "0"
+enable_mla = os.environ.get("FLASHINFER_ENABLE_MLA", "1") == "1"
+if enable_mla:
+    # TODO(yzhan): only support bf16 for MLA at the moment
+    enable_f16 = False
 
 def write_if_different(path: Path, content: str) -> None:
     if path.exists() and path.read_text() == content:
@@ -110,6 +113,7 @@ def generate_cuda() -> None:
             enable_bf16=enable_bf16,
             enable_fp8_e4m3=enable_fp8_e4m3,
             enable_fp8_e5m2=enable_fp8_e5m2,
+            enable_mla=enable_mla,
         )
     )
 
@@ -245,21 +249,36 @@ if enable_aot:
         "csrc/single_prefill.cu",
         "csrc/flashinfer_ops.cu",
     ]
+    
+    # Add MLA sources if enabled
+    if enable_mla:
+        kernel_sources.extend([
+            "csrc/batch_mla_run.cu",
+            "csrc/batch_mla_plan.cu",
+            "csrc/batch_mla_pybind.cu",
+        ])
+    
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",
         "csrc/single_prefill_sm90.cu",
         "csrc/batch_prefill_sm90.cu",
         "csrc/flashinfer_ops_sm90.cu",
     ]
+    
+    # Add MLA SM90 sources if enabled
+    if enable_mla:
+        kernel_sm90_sources.append("csrc/batch_mla_sm90_run.cu")
+
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
     prefill_sources = [
         f for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
     ]
     prefill_sm90_sources = list(gen_dir.glob("*prefill_head*_sm90.cu"))
+    mla_sources = list(gen_dir.glob("*mla_head*.cu")) if enable_mla else []
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer.flashinfer_kernels",
-            sources=kernel_sources + decode_sources + prefill_sources,
+            sources=kernel_sources + decode_sources + prefill_sources + mla_sources,
             include_dirs=include_dirs,
             libraries=libraries,
             extra_compile_args={

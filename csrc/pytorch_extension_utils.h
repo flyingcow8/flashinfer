@@ -50,6 +50,10 @@ extern "C" { \
       -1,     /* size of per-interpreter state of the module, \
                  or -1 if the module keeps state in global variables. */ \
       NULL,   /* methods */ \
+      NULL,   /* m_slots */ \
+      NULL,   /* m_traverse */ \
+      NULL,   /* m_clear */ \
+      NULL    /* m_free */ \
     }; \
     return PyModule_Create(&module_def); \
   } \

@@ -145,4 +145,16 @@ def get_aot_default_additional_params_header_str() -> str:
         is_sm90_template=True,
     )
 
+    ret += generate_macro_entry(
+        "BATCH_MLA",
+        [],  # additional_tensor_names - MLA doesn't need additional tensors in AOT mode
+        [],  # additional_tensor_dtypes
+        [
+            "sm_scale",
+            "rope_rcp_scale", 
+            "rope_rcp_theta"
+        ],  # additional_scalar_names
+        ["double", "double", "double"],  # additional_scalar_dtypes
+    )
+
     return ret

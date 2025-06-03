@@ -20,7 +20,12 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import gen_batch_mla_module
+from .jit import (
+    gen_batch_mla_module,
+    get_batch_mla_uri,
+    has_prebuilt_ops,
+    prebuilt_ops_uri,
+)
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
@@ -41,7 +46,25 @@ def get_batch_mla_module(backend):
             _batch_mla_modules if backend == "fa2" else _batch_mla_sm90_modules
         )
         if args not in modules_dict:
-            modules_dict[args] = gen_batch_mla_module(backend, *args)
+            uri = get_batch_mla_uri(backend, *args)
+            if has_prebuilt_ops and uri in prebuilt_ops_uri:
+                if backend == "fa2":
+                    _kernels = torch.ops.flashinfer_kernels
+                    plan_func = _kernels.plan
+                    run_func = _kernels.run
+                else:
+                    raise NotImplementedError("SM90 backend not implemented yet")
+            else:
+                module = gen_batch_mla_module(backend, *args)
+                plan_func = module.plan
+                run_func = module.run
+
+            # Register the module
+            modules_dict[args] = SimpleNamespace(
+                plan=plan_func,
+                run=run_func,
+            )
+
         return modules_dict[args]
 
     return backend_module

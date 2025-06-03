@@ -26,6 +26,7 @@ from . import (
     generate_batch_ragged_prefill_inst,
     generate_single_decode_inst,
     generate_single_prefill_inst,
+    generate_batch_mla_inst,
 )
 
 
@@ -44,6 +45,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     enable_bf16: bool = args.enable_bf16
     enable_fp8_e4m3: bool = args.enable_fp8_e4m3
     enable_fp8_e5m2: bool = args.enable_fp8_e5m2
+    enable_mla: bool = args.enable_mla
 
     path.mkdir(parents=True, exist_ok=True)
 
@@ -250,11 +252,48 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"f16qk_{bool(use_fp16_qk_reduction)}"
                         )
 
+    # batch MLA files
+    batch_mla_uris = []
+    if enable_mla:
+        # Common MLA head dimension combinations for DeepSeek models
+        mla_head_dims = [
+            (512, 64),   # DeepSeek-V2 with matrix absorption: head_dim_ckv=512, head_dim_kpe=64
+        ]
+        
+        for head_dim_ckv, head_dim_kpe in mla_head_dims:
+            for idtype in idtypes:
+                for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
+                    product(fp16_dtypes, fp8_dtypes)
+                ):
+                    dtype_out = dtype_q
+                    fname = f"batch_mla_head_ckv_{head_dim_ckv}_head_kpe_{head_dim_kpe}_dtype_q_{dtype_q}_dtype_kv_{dtype_kv}_dtype_out_{dtype_out}_idtype_{idtype}.cu"
+                    content = generate_batch_mla_inst.get_cu_file_str(
+                        head_dim_ckv,
+                        head_dim_kpe,
+                        dtype_q,
+                        dtype_kv,
+                        dtype_out,
+                        idtype,
+                    )
+                    
+                    # Generate URIs for both FA2 and FA3 backends
+                    for backend in ["", "_sm90"]:
+                        batch_mla_uris.append(
+                            f"batch_mla_attention_dtype_q_{dtype_q}_"
+                            f"dtype_kv_{dtype_kv}_"
+                            f"dtype_o_{dtype_out}_"
+                            f"dtype_idx_{idtype}_"
+                            f"head_dim_ckv_{head_dim_ckv}_"
+                            f"head_dim_kpe_{head_dim_kpe}{backend}"
+                        )
+                    write_if_different(path / fname, content)
+
     return (
         single_decode_uris
         + batch_decode_uris
         + single_prefill_uris
         + batch_prefill_uris
+        + batch_mla_uris
     )
 
 
