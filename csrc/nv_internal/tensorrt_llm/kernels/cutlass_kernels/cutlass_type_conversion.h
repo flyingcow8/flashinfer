@@ -18,14 +18,20 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if defined(ENABLE_FP4)
 #include <cuda_fp4.h>
+#endif
+#if defined(ENABLE_FP8)
 #include <cuda_fp8.h>
+#endif
 
 #include "cutlass/bfloat16.h"
-#include "cutlass/float8.h"
 #include "cutlass/float_subbyte.h"
 #include "cutlass/half.h"
 #include "tensorrt_llm/common/NvInferRuntime.h"
+#if defined(ENABLE_FP8)
+#include "cutlass/float8.h"
+#endif
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -48,15 +54,19 @@ struct CutlassType<nvinfer1::DataType::kBF16> {
   using type = cutlass::bfloat16_t;
 };
 
+#if defined(ENABLE_FP8)
 template <>
 struct CutlassType<nvinfer1::DataType::kFP8> {
   using type = cutlass::float_e4m3_t;
 };
+#endif
 
+#if defined(ENABLE_FP4)
 template <>
 struct CutlassType<nvinfer1::DataType::kFP4> {
   using type = cutlass::float_e2m1_t;
 };
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Tllm to Cutlass

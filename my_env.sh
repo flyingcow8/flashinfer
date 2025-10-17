@@ -1,0 +1,4 @@
+#!/bin/bash
+
+export TORCH_CUDA_ARCH_LIST="8.0"
+export FLASHINFER_JIT_VERBOSE=1

@@ -30,6 +30,15 @@
 namespace tensorrt_llm {
 namespace common {
 
+#ifndef ENABLE_FP8
+template <typename T, int PACK_SIZE>
+struct PackType {
+  struct alignas(sizeof(T) * PACK_SIZE) type {
+    T array[PACK_SIZE];
+  };
+};
+#endif
+
 template <typename T>
 inline __device__ T ldg(T const* val) {
   return __ldg(val);
