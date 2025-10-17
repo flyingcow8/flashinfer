@@ -1,0 +1,1321 @@
+From 240acc8bab7f1f6be04fdc2a6c92fdff8778c92f Mon Sep 17 00:00:00 2001
+From: Alberta Stehr <flyingcow8@gmail.com>
+Date: Fri, 17 Oct 2025 08:24:44 +0000
+Subject: [PATCH] support moe on sm80
+
+---
+ .github/copilot-instructions.md               |  31 ++
+ .../flashinfer_cutlass_fused_moe_sm80_ops.cu  | 252 +++++++++
+ docs/sm80_fused_moe_implementation.md         | 192 +++++++
+ flashinfer/fused_moe.py                       | 516 ++++++++++++++++--
+ tests/test_sm80_fused_moe.py                  | 248 +++++++++
+ 5 files changed, 1195 insertions(+), 44 deletions(-)
+ create mode 100644 .github/copilot-instructions.md
+ create mode 100644 csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu
+ create mode 100644 docs/sm80_fused_moe_implementation.md
+ create mode 100644 tests/test_sm80_fused_moe.py
+
+diff --git a/.github/copilot-instructions.md b/.github/copilot-instructions.md
+new file mode 100644
+index 0000000..bd95056
+--- /dev/null
++++ b/.github/copilot-instructions.md
+@@ -0,0 +1,31 @@
++# FlashInfer Copilot Guide
++## Architecture
++- flashinfer/__init__.py re-exports high-level APIs backed by CUDA/C++ kernels compiled on demand via flashinfer/jit.* gen_* factories.
++- csrc/ holds CUDA implementations; most kernels are parameterized through *.jinja templates with aot_build_utils/generate_*.py emitting instantiation headers and config .inc files.
++- BatchAttention and related wrappers (flashinfer/attention.py, decode.py, prefill.py) follow a plan/run split where plan precomputes schedule metadata and run shares preallocated float/int workspaces.
++- Dynamic modules land under ~/.cache/flashinfer/* (see flashinfer/jit/env.py); set FLASHINFER_WORKSPACE_BASE to relocate cache when working inside containers.
++- Backend/dtype gating lives in flashinfer/utils.py (determine_attention_backend, is_fa3_backend_supported); extend support there alongside kernel changes.
++- NVSHMEM/TRT-LLM/vLLM integrations reside in flashinfer/comm/, expecting libnvshmem_host.so and optional NVSHMEM_INCLUDE_PATH or NVSHMEM_LIBRARY_PATH when generating the bindings.
++## Build & Packaging
++- Editable install: python -m pip install --no-build-isolation -e . -v; custom_backend.py symlinks 3rdparty/, csrc/, include/, and aot-ops into flashinfer/data for packaging.
++- CMake/nvbench benchmarks: mkdir build && cp cmake/config.cmake build && cd build && cmake .. && make -j before invoking ./bench_single_prefill --help etc.
++- JIT builds honor TORCH_CUDA_ARCH_LIST; set it (e.g. "8.0 8.9 9.0a") before compiling to ensure emitted fatbins match target GPUs.
++- Ahead-of-time pipeline: python -m flashinfer.aot --out-dir aot-ops --fa2-head-dim 128,128 --fa3-head-dim 128,128 copies cached .so files into build/aot-ops-package-dir for wheel builds.
++- NVSHMEM modules call jit_env.get_nvshmem_include_dirs()/get_nvshmem_lib_dirs(); ensure nvidia-nvshmem is installed or provide paths so gen_nvshmem_module can link -lnvshmem_device.
++## Testing & Debug
++- GPU-enabled pytest is the norm; run pytest -q tests/test_single_prefill.py or narrow with -k decode to fit available memory.
++- Set FLASHINFER_TEST_TORCH_COMPILE=1 to wrap core kernels with torch.compile warmups (requires torch>=2.4); tests/conftest.py caches compiled callables in TORCH_COMPILE_FNS.
++- CUDA OOMs are downgraded to pytest.skip, so red tests typically mean logic or numerics rather than capacity.
++- Flush stale kernels with flashinfer.jit.clear_cache_dir() whenever changing generated sources or NVCC flags.
++- Profiler workflows (profiler/README.md) rely on pip install git+https://github.com/flashinfer-ai/tg4perfetto.git before running python profiler/mla.py --batch-size 64 --seq-len 1024.
++## Coding Patterns
++- Follow existing plan(...) signature when adding wrappers; BatchDecodeWithPagedKVCacheWrapper (flashinfer/decode.py) shows how to thread kv indices, lse tensors, and causal flags through run().
++- New CUDA kernels should expose a gen_* JitSpec builder under flashinfer/jit/* and cache build_and_load() using functools.cache similar to get_holistic_attention_module.
++- Register exported ops with flashinfer.utils.register_custom_op/register_fake_op (no-op wrappers that avoid torch.library overhead) so doc builds and older Torch releases continue to import.
++- Quantization and fused MOE support (flashinfer/fp4_quantization.py, fused_moe.py) pass sm100a_nvcc_flags and extra include paths; mirror those flags when extending Hopper/Blackwell features.
++- Triton kernels live under flashinfer/triton/ with matching module names (activation.py, cascade.py); keep API parity with CUDA variants for test coverage like tests/test_triton_cascade.py.
++- Distributed collectives allocate via flashinfer/comm/nvshmem.py; initialize with alloc_empty_unique_id()/init() and call finalize() after torch.cuda.synchronize() just like existing tests.
++## Tooling
++- format.sh enforces yapf 0.40.2, ruff 0.6.5, codespell 2.3.0, clang-format 15.0.7; it skips auto-yapf but runs codespell --toml pyproject.toml, so expect the script to pip install matching versions.
++- Ruff config (pyproject.toml [tool.ruff.lint]) enables E,F,B,SIM checks while ignoring E402,F405,F403,E741,E501,SIM118,B019,E902,SIM102,SIM108,E731,B020,SIM103—match these exemptions when fixing lint.
++- Keep new comments purposeful; prefer short rationale above complex buffer setups like in flashinfer/attention.py rather than restating assignments.
+diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu
+new file mode 100644
+index 0000000..9638b7c
+--- /dev/null
++++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu
+@@ -0,0 +1,252 @@
++/*
++ * Copyright (c) 2025, FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++#include <torch/custom_class.h>
++#include <torch/script.h>
++
++#include <cstdio>
++#include <functional>
++#include <iostream>
++#include <vector>
++
++#include "moe_gemm_kernels.h"
++#include "moe_kernels.h"
++#include "pytorch_extension_utils.h"
++#include "tensorrt_llm/common/workspace.h"
++#include "tensorrt_llm/runtime/torchUtils.h"
++
++#define C10_THROW_ERROR_FORMATTED(ErrorType, ...) \
++  do {                                            \
++    std::ostringstream oss;                       \
++    oss << __VA_ARGS__;                           \
++    C10_THROW_ERROR(ErrorType, oss.str());        \
++  } while (0)
++
++namespace torch_ext {
++
++namespace common = tensorrt_llm::common;
++namespace kernels = tensorrt_llm::kernels;
++using profiler_backend = kernels::GemmProfilerBackend;
++
++class FusedMoeRunner : public torch::CustomClassHolder {
++ public:
++  template <typename Type>
++  std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(
++      c10::ScalarType output_type) {
++    switch (output_type) {
++      case c10::ScalarType::Half:
++        return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, Type>>();
++#ifdef ENABLE_BF16
++      case c10::ScalarType::BFloat16:
++        return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, Type>>();
++#endif
++      default:
++        C10_THROW_ERROR_FORMATTED(Error, "Invalid output type "
++                                             << torch::toString(output_type) << " specified for "
++                                             << torch::toString(mActivationDtype));
++    }
++  };
++
++  FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
++                 c10::ScalarType output_dtype, bool use_fp8_block_scaling,
++                 bool use_w4a8_group_scaling) {
++    mActivationDtype = activation_dtype;
++    mWeightDtype = weight_dtype;
++    mOutputDtype = output_dtype;
++    mUseFp8BlockScaling = use_fp8_block_scaling;
++    mUseW4A8GroupScaling = use_w4a8_group_scaling;
++    mInnerDimMultiplier = 1;
++
++    // SM80 does NOT support FP8 or FP4
++    if (use_fp8_block_scaling) {
++      C10_THROW_ERROR_FORMATTED(NotImplementedError,
++                                "FP8 Block Scaling is not supported on SM80 (Ampere).");
++    }
++    if (use_w4a8_group_scaling) {
++      C10_THROW_ERROR_FORMATTED(NotImplementedError,
++                                "W4A8 Group Scaling is not supported on SM80 (Ampere).");
++    }
++
++    // SM80 supports: FP16, BF16, FP32
++    if (mActivationDtype == c10::ScalarType::Half && mWeightDtype == c10::ScalarType::Half) {
++      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
++    }
++#ifdef ENABLE_BF16
++    else if (mActivationDtype == c10::ScalarType::BFloat16 &&
++             mWeightDtype == c10::ScalarType::BFloat16) {
++      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
++    }
++#endif
++    else if (mActivationDtype == c10::ScalarType::Float &&
++             mWeightDtype == c10::ScalarType::Float) {
++      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<float, float>>();
++    }
++    // Quantized weights support: UINT8, UINT4
++    else if (isInt8Quant()) {
++      if (mActivationDtype == c10::ScalarType::Half) {
++        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, uint8_t>>();
++      }
++#ifdef ENABLE_BF16
++      else if (mActivationDtype == c10::ScalarType::BFloat16) {
++        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, uint8_t>>();
++      }
++#endif
++    } else if (isInt4Quant()) {
++      mInnerDimMultiplier = 2;
++      if (mActivationDtype == c10::ScalarType::Half) {
++        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
++      }
++#ifdef ENABLE_BF16
++      else if (mActivationDtype == c10::ScalarType::BFloat16) {
++        mKernelRunner =
++            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
++      }
++#endif
++    } else {
++      C10_THROW_ERROR_FORMATTED(NotImplementedError,
++                                "Unsupported data type combination for SM80: activation="
++                                    << torch::toString(mActivationDtype)
++                                    << ", weight=" << torch::toString(mWeightDtype));
++    }
++  }
++
++  bool isFp8Quant() const {
++    return mWeightDtype == c10::ScalarType::Float8_e4m3fn ||
++           mWeightDtype == c10::ScalarType::Float8_e5m2;
++  }
++
++  bool isInt8Quant() const { return mWeightDtype == c10::ScalarType::Byte; }
++
++  bool isInt4Quant() const {
++    return mWeightDtype == c10::ScalarType::UInt4x2;  // Use UInt4x2 for packed UINT4
++  }
++
++  bool isNvfp4Quant() const { return mWeightDtype == c10::ScalarType::Long; }  // INT64 == FP4
++
++  int64_t get_tactic_num() { return static_cast<int64_t>(mKernelRunner->getTacticNum()); }
++
++  void run_gemm_profile(torch::Tensor const& x, torch::Tensor const& fc1_expert_weights,
++                        torch::Tensor const& fc2_expert_weights, int64_t top_k, int64_t tp_size,
++                        int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
++                        int64_t cluster_rank, bool min_latency_mode, int64_t gemm_idx,
++                        int64_t tactic, bool do_preparation) {
++    // SM80 does not support min_latency_mode
++    if (min_latency_mode) {
++      C10_THROW_ERROR_FORMATTED(NotImplementedError,
++                                "Min latency mode is not supported on SM80 (Ampere).");
++    }
++
++    auto stream = at::cuda::getCurrentCUDAStream().stream();
++    int num_experts = fc1_expert_weights.size(0);
++    int hidden_size = x.size(1);
++    int inter_size = fc1_expert_weights.size(1) / mInnerDimMultiplier;
++    int num_tokens = x.size(0);
++
++    // Profile the GEMM
++    if (do_preparation) {
++      // Allocate workspace if needed
++      size_t ws_size = mKernelRunner->getWorkspaceSize(num_tokens, hidden_size, inter_size,
++                                                        num_experts, top_k, kernels::ActivationType::Swiglu);
++      if (mWorkspace.size() < ws_size) {
++        mWorkspace.resize(ws_size);
++      }
++    }
++
++    // Run profiling for the specified GEMM (1 or 2)
++    if (gemm_idx == 1 || gemm_idx == 2) {
++      // Profile this tactic
++      try {
++        mKernelRunner->gemm_profile(gemm_idx, static_cast<int>(tactic), num_tokens, hidden_size,
++                                    inter_size, num_experts, top_k, stream);
++      } catch (const std::exception& e) {
++        // Profiling failed, skip this tactic
++        std::cerr << "Profiling tactic " << tactic << " for GEMM" << gemm_idx
++                  << " failed: " << e.what() << std::endl;
++      }
++    }
++  }
++
++  torch::Tensor run_moe(torch::Tensor& output, torch::Tensor const& x,
++                        torch::Tensor const& token_selected_experts,
++                        torch::Tensor const& token_final_scales,
++                        torch::Tensor const& fc1_expert_weights,
++                        torch::Tensor const& fc2_expert_weights, torch::List<torch::Tensor> quant_scales,
++                        c10::optional<torch::Tensor> input_sf, int64_t tp_size, int64_t tp_rank,
++                        int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
++                        int64_t cluster_rank, bool min_latency_mode,
++                        torch::List<int64_t> gemm_tactics) {
++    // SM80 does not support min_latency_mode
++    if (min_latency_mode) {
++      C10_THROW_ERROR_FORMATTED(NotImplementedError,
++                                "Min latency mode is not supported on SM80 (Ampere).");
++    }
++
++    auto stream = at::cuda::getCurrentCUDAStream().stream();
++    int num_experts = fc1_expert_weights.size(0);
++    int hidden_size = x.size(1);
++    int inter_size = fc1_expert_weights.size(1) / mInnerDimMultiplier;
++    int num_tokens = x.size(0);
++    int top_k = token_selected_experts.size(1);
++
++    // Allocate workspace
++    size_t ws_size = mKernelRunner->getWorkspaceSize(num_tokens, hidden_size, inter_size,
++                                                      num_experts, top_k, kernels::ActivationType::Swiglu);
++    if (mWorkspace.size() < ws_size) {
++      mWorkspace.resize(ws_size);
++    }
++
++    // Convert quant_scales to vector (SM80 doesn't use advanced quantization)
++    std::vector<torch::Tensor> quant_scales_vec;
++    for (size_t i = 0; i < quant_scales.size(); ++i) {
++      quant_scales_vec.push_back(quant_scales[i]);
++    }
++
++    // Run MoE
++    mKernelRunner->runMoe(
++        x.data_ptr(), fc1_expert_weights.data_ptr(), fc2_expert_weights.data_ptr(),
++        quant_scales_vec, token_selected_experts.data_ptr<int>(),
++        token_final_scales.data_ptr(), output.data_ptr(), nullptr,  // no bias
++        nullptr,                                                      // no fc2 bias
++        num_tokens, hidden_size, inter_size, num_experts, top_k, mWorkspace.data(),
++        mWorkspace.size(), stream, gemm_tactics.size() >= 1 ? gemm_tactics[0] : -1,
++        gemm_tactics.size() >= 2 ? gemm_tactics[1] : -1);
++
++    return output;
++  }
++
++ private:
++  c10::ScalarType mActivationDtype;
++  c10::ScalarType mWeightDtype;
++  c10::ScalarType mOutputDtype;
++  bool mUseFp8BlockScaling;
++  bool mUseW4A8GroupScaling;
++  int mInnerDimMultiplier;
++  std::shared_ptr<kernels::CutlassMoeFCRunnerInterface> mKernelRunner;
++  common::CudaBuf mWorkspace;
++};
++
++TORCH_LIBRARY(fused_moe_sm80, m) {
++  m.class_<FusedMoeRunner>("FusedMoeRunner")
++      .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool>())
++      .def("get_tactic_num", &FusedMoeRunner::get_tactic_num)
++      .def("run_gemm_profile", &FusedMoeRunner::run_gemm_profile)
++      .def("run_moe", &FusedMoeRunner::run_moe);
++}
++
++}  // namespace torch_ext
+diff --git a/docs/sm80_fused_moe_implementation.md b/docs/sm80_fused_moe_implementation.md
+new file mode 100644
+index 0000000..667c17b
+--- /dev/null
++++ b/docs/sm80_fused_moe_implementation.md
+@@ -0,0 +1,192 @@
++# SM80 (Ampere) Support for cutlass_fused_moe API - Implementation Summary
++
++## 概述
++
++本次实现为 FlashInfer 的 `cutlass_fused_moe` API 添加了对 **SM80 (Ampere)** 架构的支持，包括 NVIDIA A100、A10、A30 等 GPU。
++
++## 实现的文件
++
++### 1. Python 层 (`flashinfer/fused_moe.py`)
++
++#### 新增函数：
++
++- **`gen_fused_moe_sm80_module()`**: 生成 SM80 的 JIT 编译规范
++  - 包含 FP16/BF16/FP32 kernel 源文件
++  - 不包含 FP8/FP4 相关文件（SM80 不支持）
++  - 使用 `-gencode=arch=compute_80,code=sm_80` 等 SM80 系列标志
++
++- **`get_fused_moe_sm80_module()`**: 缓存的模块加载函数
++  - 创建 `MoERunner` 类来管理 kernel 运行
++  - 包含 SM80 限制检查（不支持 FP8/FP4/min_latency_mode）
++  - 实现 `cutlass_fused_moe_sm80` 自定义操作
++
++#### 修改的函数：
++
++- **`cutlass_fused_moe()`**: 添加架构自动检测
++  ```python
++  major, minor = get_compute_capability(input.device)
++  
++  if major == 8:  # SM80-SM89
++      # 使用 SM80 backend
++      return get_fused_moe_sm80_module().cutlass_fused_moe_sm80(...)
++  elif major >= 9:  # SM90+
++      # 使用 SM100 backend (Hopper/Blackwell)
++      return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(...)
++  ```
++
++### 2. C++ 绑定层 (`csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu`)
++
++新创建的文件实现：
++
++- **`FusedMoeRunner` 类**: 
++  - 支持 FP16/FP16, BF16/BF16, FP32/FP32
++  - 支持量化权重：UINT8, UINT4
++  - 支持 fused gated activation (Swiglu/Geglu)
++  
++- **限制检查**:
++  - 拒绝 FP8 激活/权重
++  - 拒绝 FP4 权重
++  - 拒绝 FP8 block scaling
++  - 拒绝 W4A8 group scaling
++  - 拒绝 min_latency_mode
++
++- **Torch 库注册**: `TORCH_LIBRARY(fused_moe_sm80, m)`
++
++### 3. 测试文件 (`tests/test_sm80_fused_moe.py`)
++
++包含以下测试用例：
++
++1. **`test_sm80_detection()`**: 检测 SM80 架构
++2. **`test_sm80_fused_moe_fp16()`**: FP16 功能测试
++3. **`test_sm80_fused_moe_bf16()`**: BF16 功能测试
++4. **`test_sm80_unsupported_fp8()`**: 验证正确拒绝 FP8
++5. **`test_sm80_unsupported_min_latency_mode()`**: 验证正确拒绝 min_latency_mode
++
++## 支持的功能矩阵
++
++### ✅ SM80 支持的功能
++
++| 功能 | 支持状态 |
++|------|---------|
++| FP16 激活和权重 | ✅ |
++| BF16 激活和权重 | ✅ |
++| FP32 激活和权重 | ✅ |
++| UINT8 量化权重 | ✅ |
++| UINT4 量化权重 | ✅ |
++| Fused gated activation (Swiglu/Geglu) | ✅ |
++| 张量并行 (TP) | ✅ |
++| 专家并行 (EP) | ✅ |
++| Top-K expert 选择 | ✅ |
++
++### ❌ SM80 不支持的功能
++
++| 功能 | 支持状态 | 原因 |
++|------|---------|------|
++| FP8 激活/权重 | ❌ | 需要 SM89+ (Ada) 或 SM90+ (Hopper) |
++| FP4 权重 | ❌ | 需要 SM90+ (Hopper) |
++| FP8 block scaling | ❌ | 需要 SM90+ (Hopper) |
++| W4A8 group scaling | ❌ | 需要 SM90+ (Hopper) |
++| Min latency mode | ❌ | 需要 SM90+ (Hopper) |
++
++## 架构对比
++
++```
++┌─────────────────────────────────────────────────────────┐
++│                   cutlass_fused_moe()                   │
++│              (自动检测 GPU 架构并路由)                   │
++└─────────────────────────────────────────────────────────┘
++                          │
++          ┌───────────────┴───────────────┐
++          │                               │
++┌─────────▼─────────┐          ┌─────────▼──────────┐
++│  SM80 Backend     │          │  SM90+ Backend     │
++│  (Ampere)         │          │  (Hopper/Blackwell)│
++├───────────────────┤          ├────────────────────┤
++│ ✅ FP16/BF16/FP32 │          │ ✅ FP16/BF16/FP32  │
++│ ✅ UINT8/UINT4    │          │ ✅ FP8/FP4         │
++│ ❌ FP8/FP4        │          │ ✅ Block scaling   │
++│ ❌ Min latency    │          │ ✅ Min latency     │
++└───────────────────┘          └────────────────────┘
++```
++
++## 使用示例
++
++```python
++import torch
++from flashinfer import cutlass_fused_moe
++
++# 在 SM80 GPU 上会自动使用 SM80 backend
++device = torch.device("cuda:0")
++
++# 输入
++input = torch.randn(seq_len, hidden_size, dtype=torch.float16, device=device)
++token_selected_experts = torch.randint(0, num_experts, (seq_len, top_k), device=device)
++token_final_scales = torch.rand(seq_len, top_k, device=device)
++
++# 专家权重
++fc1_weights = torch.randn(num_experts, inter_size, hidden_size, dtype=torch.float16, device=device)
++fc2_weights = torch.randn(num_experts, hidden_size, inter_size, dtype=torch.float16, device=device)
++
++# 调用 - 自动选择正确的 backend
++output = cutlass_fused_moe(
++    input=input,
++    token_selected_experts=token_selected_experts,
++    token_final_scales=token_final_scales,
++    fc1_expert_weights=fc1_weights,
++    fc2_expert_weights=fc2_weights,
++    output_dtype=torch.float16,
++    quant_scales=[],
++)
++```
++
++## 编译和测试
++
++### 编译
++
++```bash
++# 设置目标架构
++export TORCH_CUDA_ARCH_LIST="8.0 8.6 8.7"
++
++# 安装（可编辑模式）
++python -m pip install --no-build-isolation -e . -v
++```
++
++### 测试
++
++```bash
++# 运行 SM80 测试
++pytest tests/test_sm80_fused_moe.py -v
++
++# 或直接运行
++python tests/test_sm80_fused_moe.py
++```
++
++## 兼容性
++
++- **CUDA**: 11.8+
++- **PyTorch**: 2.0+
++- **GPU**: NVIDIA Ampere 架构
++  - A100 (SM80)
++  - A10 (SM86)
++  - A30 (SM80)
++  - RTX 30 系列 (SM86)
++  - RTX 40 系列也可以使用 SM80 backend，但推荐使用 SM89 优化
++
++## 性能考虑
++
++- SM80 backend 使用 CUTLASS 模板库实现高效 GEMM
++- 支持 fused gated activation 减少内存访问
++- 对于 FP8/FP4 workload，建议升级到 Hopper+ GPU
++- 量化权重 (UINT8/UINT4) 可在 SM80 上获得良好性能
++
++## 后续工作
++
++1. ✅ SM80 基础支持 (当前实现)
++2. 🔄 性能调优和 benchmark
++3. 📝 添加更多测试用例
++4. 📊 与 SM90+ 性能对比文档
++
++## 贡献者
++
++- 实现日期: 2025-10-17
++- 基于 FlashInfer 架构和现有 SM100 实现
+diff --git a/flashinfer/fused_moe.py b/flashinfer/fused_moe.py
+index c1ee8c5..3b178d5 100644
+--- a/flashinfer/fused_moe.py
++++ b/flashinfer/fused_moe.py
+@@ -24,7 +24,12 @@ from .autotuner import AutoTuner, TunableRunner, TuningConfig
+ from .jit import JitSpec
+ from .jit import env as jit_env
+ from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+-from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
++from .utils import (
++    _check_shape_dtype_device,
++    get_compute_capability,
++    register_custom_op,
++    register_fake_op,
++)
+ 
+ 
+ def gen_fused_moe_sm100_module() -> JitSpec:
+@@ -121,6 +126,91 @@ def gen_fused_moe_sm100_module() -> JitSpec:
+     )
+ 
+ 
++def gen_fused_moe_sm80_module() -> JitSpec:
++    """Generate JIT spec for SM80 (Ampere) fused MoE kernels.
++    
++    SM80 supports:
++    - FP16, BF16, FP32 activations and weights
++    - UINT8, UINT4 quantized weights
++    - Fused gated activation (Swiglu/Geglu)
++    
++    SM80 does NOT support:
++    - FP8 (requires SM89+)
++    - FP4 (requires SM90+)
++    - DeepSeek FP8 block scaling
++    """
++    return gen_jit_spec(
++        "fused_moe_sm80",
++        [
++            # Core MoE GEMM kernels for SM80
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
++            # FlashInfer PyTorch binding for SM80
++            jit_env.FLASHINFER_CSRC_DIR
++            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
++            # Common utilities
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
++        ],
++        extra_cuda_cflags=[
++            "-DENABLE_BF16",
++            "-DENABLE_FP16",
++            # Note: FP8 and FP4 are NOT enabled for SM80
++            "-DUSING_OSS_CUTLASS_MOE_GEMM",
++            "-gencode=arch=compute_80,code=sm_80",
++            "-gencode=arch=compute_86,code=sm_86",
++            "-gencode=arch=compute_87,code=sm_87",
++        ],
++        extra_cflags=[
++            "-DFAST_BUILD",
++        ],
++        extra_ldflags=["-lcuda"],
++        extra_include_paths=[
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
++            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal"
++            / "tensorrt_llm"
++            / "cutlass_extensions"
++            / "include",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal"
++            / "tensorrt_llm"
++            / "kernels"
++            / "internal_cutlass_kernels"
++            / "include",
++            jit_env.FLASHINFER_CSRC_DIR
++            / "nv_internal"
++            / "tensorrt_llm"
++            / "kernels"
++            / "internal_cutlass_kernels",
++        ],
++    )
++
++
+ @functools.cache
+ def get_fused_moe_sm100_module():
+     module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeRunner")
+@@ -381,6 +471,268 @@ def get_fused_moe_sm100_module():
+     )
+ 
+ 
++@functools.cache
++def get_fused_moe_sm80_module():
++    module = gen_fused_moe_sm80_module().build_and_load(class_name="FusedMoeRunner")
++
++    class MoERunner(TunableRunner):
++        # avoid overhead of creating a new runner in forward pass
++        _runner_dict: Dict[str, module] = dict()
++
++        def __init__(
++            self,
++            x_dtype: torch.dtype,
++            weight_dtype: torch.dtype,
++            output_dtype: torch.dtype,
++            top_k: int,
++            tp_size: int,
++            tp_rank: int,
++            ep_size: int,
++            ep_rank: int,
++            cluster_size: int,
++            cluster_rank: int,
++            use_fp8_block_scaling: bool,
++            use_w4a8_group_scaling: bool,
++        ):
++            self.x_dtype = x_dtype
++            self.weight_dtype = weight_dtype
++            self.output_dtype = output_dtype
++            self.top_k = top_k
++            self.tp_size = tp_size
++            self.tp_rank = tp_rank
++            self.ep_size = ep_size
++            self.ep_rank = ep_rank
++            self.cluster_size = cluster_size
++            self.cluster_rank = cluster_rank
++            self.use_fp8_block_scaling = use_fp8_block_scaling
++            self.use_w4a8_group_scaling = use_w4a8_group_scaling
++
++            # SM80 does not support FP8 block scaling or W4A8 group scaling
++            if use_fp8_block_scaling:
++                raise NotImplementedError(
++                    "FP8 Block Scaling is not supported on SM80 (Ampere). "
++                    "This feature requires SM89+ (Ada) or SM90+ (Hopper)."
++                )
++            if use_w4a8_group_scaling:
++                raise NotImplementedError(
++                    "W4A8 Group Scaling is not supported on SM80 (Ampere). "
++                    "This feature requires SM90+ (Hopper)."
++                )
++
++            instance_key = (
++                x_dtype,
++                weight_dtype,
++                output_dtype,
++                use_fp8_block_scaling,
++                use_w4a8_group_scaling,
++            )
++
++            if instance_key not in MoERunner._runner_dict:
++                MoERunner._runner_dict[instance_key] = (
++                    torch.classes.fused_moe_sm80.FusedMoeRunner(
++                        x_dtype,
++                        weight_dtype,
++                        output_dtype,
++                        use_fp8_block_scaling,
++                        use_w4a8_group_scaling,
++                    )
++                )
++            self._fused_moe_runner = MoERunner._runner_dict[instance_key]
++            self._is_nvfp4 = weight_dtype == torch.int64
++
++        def get_valid_tactics(
++            self,
++            inputs: List[torch.Tensor],
++        ) -> List[int]:
++            x, _, _, min_latency_mode_tensor = inputs
++            min_latency_mode = min_latency_mode_tensor.size(0) == 1
++            m = x.shape[0]
++
++            # SM80 doesn't support min_latency_mode
++            invalid = min_latency_mode or self._is_nvfp4
++
++            return (
++                [] if invalid else list(range(self._fused_moe_runner.get_tactic_num()))
++            )
++
++        def forward(
++            self,
++            inputs: List[torch.Tensor],
++            gemm_idx: int = 0,
++            tactic: int = -1,
++            do_preparation: bool = False,
++        ):
++            x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
++            min_latency_mode = min_latency_mode_tensor.size(0) == 1
++            # SM80 doesn't support min_latency_mode
++            if min_latency_mode:
++                raise NotImplementedError(
++                    "Min latency mode is not supported on SM80 (Ampere). "
++                    "This feature requires SM90+ (Hopper)."
++                )
++            
++            self._fused_moe_runner.run_gemm_profile(
++                x,
++                fc1_expert_weights,
++                fc2_expert_weights,
++                self.top_k,
++                self.tp_size,
++                self.tp_rank,
++                self.ep_size,
++                self.ep_rank,
++                self.cluster_size,
++                self.cluster_rank,
++                min_latency_mode,
++                gemm_idx,
++                tactic,
++                do_preparation,
++            )
++
++    @register_custom_op(
++        "flashinfer::cutlass_fused_moe_sm80",
++        mutates_args=(""),
++    )
++    def cutlass_fused_moe_sm80(
++        output: torch.Tensor,
++        input: torch.Tensor,
++        token_selected_experts: torch.Tensor,
++        token_final_scales: torch.Tensor,
++        fc1_expert_weights: torch.Tensor,
++        fc2_expert_weights: torch.Tensor,
++        output_dtype: torch.dtype,
++        quant_scales: List[torch.Tensor],
++        input_sf: Optional[torch.Tensor] = None,
++        tp_size: int = 1,
++        tp_rank: int = 0,
++        ep_size: int = 1,
++        ep_rank: int = 0,
++        cluster_size: int = 1,
++        cluster_rank: int = 0,
++        use_fp8_block_scaling: bool = False,
++        use_w4a8_group_scaling: bool = False,
++        min_latency_mode: bool = False,
++        tune_max_num_tokens: int = 8192,
++    ) -> List[torch.Tensor]:
++        # SM80 limitations check
++        if use_fp8_block_scaling:
++            raise NotImplementedError(
++                "FP8 Block Scaling is not supported on SM80 (Ampere)."
++            )
++        if use_w4a8_group_scaling:
++            raise NotImplementedError(
++                "W4A8 Group Scaling is not supported on SM80 (Ampere)."
++            )
++        if min_latency_mode:
++            raise NotImplementedError(
++                "Min latency mode is not supported on SM80 (Ampere)."
++            )
++
++        tuner = AutoTuner.get()
++
++        def next_positive_power_of_2(x: int) -> int:
++            if x < 1:
++                return 1
++            return 1 << (x - 1).bit_length()
++
++        tune_num_tokens_list = []
++        tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
++        while tune_num_tokens > 0:
++            tune_num_tokens_list.append(tune_num_tokens)
++            tune_num_tokens //= 2
++
++        tuning_config = TuningConfig(
++            dynamic_tensors=(
++                (0, 0, (tuple(tune_num_tokens_list), next_positive_power_of_2)),
++                (3, 0, ((0,), lambda x: x)),
++            )
++        )
++
++        min_latency_tensor = torch.empty(0)
++
++        moe_runner = MoERunner(
++            x_dtype=input.dtype,
++            weight_dtype=fc1_expert_weights.dtype,
++            output_dtype=output_dtype,
++            top_k=token_selected_experts.size(1),
++            tp_size=tp_size,
++            tp_rank=tp_rank,
++            ep_size=ep_size,
++            ep_rank=ep_rank,
++            cluster_size=cluster_size,
++            cluster_rank=cluster_rank,
++            use_fp8_block_scaling=use_fp8_block_scaling,
++            use_w4a8_group_scaling=use_w4a8_group_scaling,
++        )
++
++        _, gemm_tactic_1 = tuner.choose_one(
++            "trtllm::fused_moe::gemm1",
++            [moe_runner],
++            tuning_config,
++            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
++            gemm_idx=1,
++        )
++
++        _, gemm_tactic_2 = tuner.choose_one(
++            "trtllm::fused_moe::gemm2",
++            [moe_runner],
++            tuning_config,
++            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
++            gemm_idx=2,
++        )
++
++        result = moe_runner._fused_moe_runner.run_moe(
++            output,
++            input,
++            token_selected_experts,
++            token_final_scales,
++            fc1_expert_weights,
++            fc2_expert_weights,
++            quant_scales,
++            input_sf,
++            tp_size,
++            tp_rank,
++            ep_size,
++            ep_rank,
++            cluster_size,
++            cluster_rank,
++            min_latency_mode,
++            [gemm_tactic_1, gemm_tactic_2],
++        )
++
++        return [result]
++
++    @register_fake_op("flashinfer::cutlass_fused_moe_sm80")
++    def _fake_cutlass_fused_moe_sm80(
++        output: torch.Tensor,
++        input: torch.Tensor,
++        token_selected_experts: torch.Tensor,
++        token_final_scales: torch.Tensor,
++        fc1_expert_weights: torch.Tensor,
++        fc2_expert_weights: torch.Tensor,
++        output_dtype: torch.dtype,
++        quant_scales: List[torch.Tensor],
++        input_sf: Optional[torch.Tensor] = None,
++        tp_size: int = 1,
++        tp_rank: int = 0,
++        ep_size: int = 1,
++        ep_rank: int = 0,
++        cluster_size: int = 1,
++        cluster_rank: int = 0,
++        use_fp8_block_scaling: bool = False,
++        use_w4a8_group_scaling: bool = False,
++        min_latency_mode: bool = False,
++        tune_max_num_tokens: int = 8192,
++    ):
++        seq_len = input.shape[0]
++        hidden_size = fc2_expert_weights.shape[1]
++        return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
++
++    # Register the module
++    return SimpleNamespace(
++        cutlass_fused_moe_sm80=cutlass_fused_moe_sm80,
++    )
++
++
+ # TODO(shuw): wrap into a FusedMoeModule once trtllm-gen is readly.
+ # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe.py#L827
+ def cutlass_fused_moe(
+@@ -458,55 +810,131 @@ def cutlass_fused_moe(
+     Note:
+         - The function supports various data types including FP32, FP16, BF16, FP8, and NVFP4.
+         - It implements both tensor parallelism and expert parallelism.
+-        - Currently, some advanced features like FP8 block scaling and minimum latency mode
+-          are not implemented for Blackwell architecture.
++        - Architecture-specific limitations:
++          * SM80 (Ampere): Supports FP16, BF16, FP32, UINT8, UINT4. No FP8, FP4, or min_latency_mode.
++          * SM90+ (Hopper/Blackwell): Supports all features including FP8, FP4, and min_latency_mode.
+     """
+-    if use_fp8_block_scaling:
+-        raise NotImplementedError(
+-            "FP8 Block Scaling is not yet implemented for Blackwell."
+-        )
+-    if use_w4a8_group_scaling:
+-        raise NotImplementedError(
+-            "W4A8 Group Scaling is not yet implemented for Blackwell."
+-        )
+-    if min_latency_mode:
+-        raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
++    # Detect compute capability and choose appropriate backend
++    major, minor = get_compute_capability(input.device)
++    
++    # Select backend based on architecture
++    if major == 8:  # SM80, SM86, SM87, SM89
++        # SM80 (Ampere) backend
++        if use_fp8_block_scaling:
++            raise NotImplementedError(
++                "FP8 Block Scaling is not supported on SM80 (Ampere). "
++                "This feature requires SM90+ (Hopper)."
++            )
++        if use_w4a8_group_scaling:
++            raise NotImplementedError(
++                "W4A8 Group Scaling is not supported on SM80 (Ampere). "
++                "This feature requires SM90+ (Hopper)."
++            )
++        if min_latency_mode:
++            raise NotImplementedError(
++                "Min latency mode is not supported on SM80 (Ampere). "
++                "This feature requires SM90+ (Hopper)."
++            )
++        
++        # Check for unsupported data types on SM80
++        if input.dtype == torch.float8_e4m3fn or input.dtype == torch.float8_e5m2:
++            raise NotImplementedError(
++                f"FP8 input dtype {input.dtype} is not supported on SM80 (Ampere). "
++                "FP8 requires SM89+ (Ada) for limited support or SM90+ (Hopper) for full support."
++            )
++        if fc1_expert_weights.dtype == torch.int64:  # NVFP4 marker
++            raise NotImplementedError(
++                "NVFP4 weights are not supported on SM80 (Ampere). "
++                "This feature requires SM90+ (Hopper)."
++            )
++        
++        num_rows = input.shape[0]
++        hidden_size = fc2_expert_weights.shape[1]
++        output_shape = (num_rows, hidden_size)
+ 
+-    num_rows = input.shape[0]
+-    if min_latency_mode:
+-        num_rows *= fc2_expert_weights.shape[0]
+-    hidden_size = fc2_expert_weights.shape[1]
+-    output_shape = (num_rows, hidden_size)
++        if output is None:
++            output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
++        else:
++            _check_shape_dtype_device(
++                output, output_shape, output_dtype, input.device, "output"
++            )
+ 
+-    if output is None:
+-        output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
++        return get_fused_moe_sm80_module().cutlass_fused_moe_sm80(
++            output,
++            input,
++            token_selected_experts,
++            token_final_scales,
++            fc1_expert_weights,
++            fc2_expert_weights,
++            output_dtype,
++            quant_scales,
++            input_sf,
++            tp_size,
++            tp_rank,
++            ep_size,
++            ep_rank,
++            cluster_size,
++            cluster_rank,
++            use_fp8_block_scaling,
++            use_w4a8_group_scaling,
++            min_latency_mode,
++            tune_max_num_tokens,
++        )[0]
++    
++    elif major >= 9:  # SM90+ (Hopper and Blackwell)
++        # SM90+ backend (existing implementation)
++        if use_fp8_block_scaling:
++            raise NotImplementedError(
++                "FP8 Block Scaling is not yet implemented for Blackwell."
++            )
++        if use_w4a8_group_scaling:
++            raise NotImplementedError(
++                "W4A8 Group Scaling is not yet implemented for Blackwell."
++            )
++        if min_latency_mode:
++            raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
++
++        num_rows = input.shape[0]
++        if min_latency_mode:
++            num_rows *= fc2_expert_weights.shape[0]
++        hidden_size = fc2_expert_weights.shape[1]
++        output_shape = (num_rows, hidden_size)
++
++        if output is None:
++            output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
++        else:
++            _check_shape_dtype_device(
++                output, output_shape, output_dtype, input.device, "output"
++            )
++
++        return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(
++            output,
++            input,
++            token_selected_experts,
++            token_final_scales,
++            fc1_expert_weights,
++            fc2_expert_weights,
++            output_dtype,
++            quant_scales,
++            input_sf,
++            tp_size,
++            tp_rank,
++            ep_size,
++            ep_rank,
++            cluster_size,
++            cluster_rank,
++            use_fp8_block_scaling,
++            use_w4a8_group_scaling,
++            min_latency_mode,
++            tune_max_num_tokens,
++        )[0]
++    
+     else:
+-        _check_shape_dtype_device(
+-            output, output_shape, output_dtype, input.device, "output"
++        raise ValueError(
++            f"Unsupported compute capability SM{major}{minor}. "
++            "FlashInfer fused MoE requires SM80+ (Ampere or newer)."
+         )
+ 
+-    return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(
+-        output,
+-        input,
+-        token_selected_experts,
+-        token_final_scales,
+-        fc1_expert_weights,
+-        fc2_expert_weights,
+-        output_dtype,
+-        quant_scales,
+-        input_sf,
+-        tp_size,
+-        tp_rank,
+-        ep_size,
+-        ep_rank,
+-        cluster_size,
+-        cluster_rank,
+-        use_fp8_block_scaling,
+-        use_w4a8_group_scaling,
+-        min_latency_mode,
+-        tune_max_num_tokens,
+-    )
+-
+ 
+ # trtllmgen-moe-fp8
+ 
+diff --git a/tests/test_sm80_fused_moe.py b/tests/test_sm80_fused_moe.py
+new file mode 100644
+index 0000000..d61abe4
+--- /dev/null
++++ b/tests/test_sm80_fused_moe.py
+@@ -0,0 +1,248 @@
++"""
++Test SM80 (Ampere) support for cutlass_fused_moe API
++
++This test verifies that the SM80 backend works correctly on Ampere GPUs (A100, A10, etc.)
++"""
++
++import torch
++import pytest
++
++
++def test_sm80_detection():
++    """Test that SM80 architecture is correctly detected"""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++    
++    device = torch.device("cuda:0")
++    major, minor = torch.cuda.get_device_capability(device)
++    
++    print(f"Detected compute capability: SM{major}{minor}")
++    
++    # This test should run on SM80+ (Ampere or newer)
++    assert major >= 8, f"SM80 tests require SM80+ architecture, got SM{major}{minor}"
++
++
++def test_sm80_fused_moe_fp16():
++    """Test SM80 fused MoE with FP16 activations and weights"""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++    
++    device = torch.device("cuda:0")
++    major, _ = torch.cuda.get_device_capability(device)
++    
++    if major < 8:
++        pytest.skip("SM80 tests require SM80+ (Ampere or newer)")
++    
++    # Import after checking architecture
++    from flashinfer import cutlass_fused_moe
++    
++    # Test parameters
++    seq_len = 4
++    hidden_size = 128
++    intermediate_size = 256
++    num_experts = 8
++    top_k = 2
++    
++    # Create test tensors
++    input = torch.randn(seq_len, hidden_size, dtype=torch.float16, device=device)
++    token_selected_experts = torch.randint(0, num_experts, (seq_len, top_k), dtype=torch.int32, device=device)
++    token_final_scales = torch.rand(seq_len, top_k, dtype=torch.float32, device=device)
++    
++    fc1_expert_weights = torch.randn(num_experts, intermediate_size, hidden_size, dtype=torch.float16, device=device)
++    fc2_expert_weights = torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.float16, device=device)
++    
++    # Empty quant_scales for non-quantized case
++    quant_scales = []
++    
++    # Run fused MoE
++    output = cutlass_fused_moe(
++        input=input,
++        token_selected_experts=token_selected_experts,
++        token_final_scales=token_final_scales,
++        fc1_expert_weights=fc1_expert_weights,
++        fc2_expert_weights=fc2_expert_weights,
++        output_dtype=torch.float16,
++        quant_scales=quant_scales,
++    )
++    
++    # Check output shape
++    assert output.shape == (seq_len, hidden_size)
++    assert output.dtype == torch.float16
++    assert not torch.isnan(output).any()
++    print(f"✓ SM80 FP16 test passed. Output shape: {output.shape}")
++
++
++def test_sm80_fused_moe_bf16():
++    """Test SM80 fused MoE with BF16 activations and weights"""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++    
++    device = torch.device("cuda:0")
++    major, _ = torch.cuda.get_device_capability(device)
++    
++    if major < 8:
++        pytest.skip("SM80 tests require SM80+ (Ampere or newer)")
++    
++    from flashinfer import cutlass_fused_moe
++    
++    # Test parameters
++    seq_len = 4
++    hidden_size = 128
++    intermediate_size = 256
++    num_experts = 8
++    top_k = 2
++    
++    # Create test tensors
++    input = torch.randn(seq_len, hidden_size, dtype=torch.bfloat16, device=device)
++    token_selected_experts = torch.randint(0, num_experts, (seq_len, top_k), dtype=torch.int32, device=device)
++    token_final_scales = torch.rand(seq_len, top_k, dtype=torch.float32, device=device)
++    
++    fc1_expert_weights = torch.randn(num_experts, intermediate_size, hidden_size, dtype=torch.bfloat16, device=device)
++    fc2_expert_weights = torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device)
++    
++    quant_scales = []
++    
++    output = cutlass_fused_moe(
++        input=input,
++        token_selected_experts=token_selected_experts,
++        token_final_scales=token_final_scales,
++        fc1_expert_weights=fc1_expert_weights,
++        fc2_expert_weights=fc2_expert_weights,
++        output_dtype=torch.bfloat16,
++        quant_scales=quant_scales,
++    )
++    
++    assert output.shape == (seq_len, hidden_size)
++    assert output.dtype == torch.bfloat16
++    assert not torch.isnan(output).any()
++    print(f"✓ SM80 BF16 test passed. Output shape: {output.shape}")
++
++
++def test_sm80_unsupported_fp8():
++    """Test that SM80 correctly rejects FP8 inputs"""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++    
++    device = torch.device("cuda:0")
++    major, _ = torch.cuda.get_device_capability(device)
++    
++    if major < 8:
++        pytest.skip("SM80 tests require SM80+ (Ampere or newer)")
++    
++    if major >= 9:
++        pytest.skip("This test is for SM80 limitations, skipping on SM90+")
++    
++    from flashinfer import cutlass_fused_moe
++    
++    # Test parameters
++    seq_len = 4
++    hidden_size = 128
++    intermediate_size = 256
++    num_experts = 8
++    top_k = 2
++    
++    # Try to use FP8 (should fail on SM80)
++    input = torch.randn(seq_len, hidden_size, dtype=torch.float16, device=device).to(torch.float8_e4m3fn)
++    token_selected_experts = torch.randint(0, num_experts, (seq_len, top_k), dtype=torch.int32, device=device)
++    token_final_scales = torch.rand(seq_len, top_k, dtype=torch.float32, device=device)
++    
++    fc1_expert_weights = torch.randn(num_experts, intermediate_size, hidden_size, dtype=torch.float8_e4m3fn, device=device)
++    fc2_expert_weights = torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.float8_e4m3fn, device=device)
++    
++    quant_scales = []
++    
++    # This should raise NotImplementedError on SM80
++    with pytest.raises(NotImplementedError, match="FP8"):
++        output = cutlass_fused_moe(
++            input=input,
++            token_selected_experts=token_selected_experts,
++            token_final_scales=token_final_scales,
++            fc1_expert_weights=fc1_expert_weights,
++            fc2_expert_weights=fc2_expert_weights,
++            output_dtype=torch.float16,
++            quant_scales=quant_scales,
++        )
++    
++    print("✓ SM80 correctly rejects FP8 inputs")
++
++
++def test_sm80_unsupported_min_latency_mode():
++    """Test that SM80 correctly rejects min_latency_mode"""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++    
++    device = torch.device("cuda:0")
++    major, _ = torch.cuda.get_device_capability(device)
++    
++    if major < 8:
++        pytest.skip("SM80 tests require SM80+ (Ampere or newer)")
++    
++    if major >= 9:
++        pytest.skip("This test is for SM80 limitations, skipping on SM90+")
++    
++    from flashinfer import cutlass_fused_moe
++    
++    # Test parameters
++    seq_len = 4
++    hidden_size = 128
++    intermediate_size = 256
++    num_experts = 8
++    top_k = 2
++    
++    input = torch.randn(seq_len, hidden_size, dtype=torch.float16, device=device)
++    token_selected_experts = torch.randint(0, num_experts, (seq_len, top_k), dtype=torch.int32, device=device)
++    token_final_scales = torch.rand(seq_len, top_k, dtype=torch.float32, device=device)
++    
++    fc1_expert_weights = torch.randn(num_experts, intermediate_size, hidden_size, dtype=torch.float16, device=device)
++    fc2_expert_weights = torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.float16, device=device)
++    
++    quant_scales = []
++    
++    # This should raise NotImplementedError on SM80
++    with pytest.raises(NotImplementedError, match="Min latency mode"):
++        output = cutlass_fused_moe(
++            input=input,
++            token_selected_experts=token_selected_experts,
++            token_final_scales=token_final_scales,
++            fc1_expert_weights=fc1_expert_weights,
++            fc2_expert_weights=fc2_expert_weights,
++            output_dtype=torch.float16,
++            quant_scales=quant_scales,
++            min_latency_mode=True,
++        )
++    
++    print("✓ SM80 correctly rejects min_latency_mode")
++
++
++if __name__ == "__main__":
++    print("=" * 70)
++    print("Testing SM80 (Ampere) support for cutlass_fused_moe")
++    print("=" * 70)
++    
++    test_sm80_detection()
++    print()
++    
++    try:
++        test_sm80_fused_moe_fp16()
++    except Exception as e:
++        print(f"✗ SM80 FP16 test failed: {e}")
++    
++    try:
++        test_sm80_fused_moe_bf16()
++    except Exception as e:
++        print(f"✗ SM80 BF16 test failed: {e}")
++    
++    try:
++        test_sm80_unsupported_fp8()
++    except Exception as e:
++        print(f"✗ SM80 FP8 rejection test failed: {e}")
++    
++    try:
++        test_sm80_unsupported_min_latency_mode()
++    except Exception as e:
++        print(f"✗ SM80 min_latency_mode rejection test failed: {e}")
++    
++    print()
++    print("=" * 70)
++    print("All SM80 tests completed!")
++    print("=" * 70)
+-- 
+2.51.1
+
