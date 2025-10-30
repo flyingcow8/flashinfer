@@ -129,6 +129,8 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 def gen_fused_moe_sm80_module() -> JitSpec:
     """Generate JIT spec for SM80 (Ampere) fused MoE kernels.
     
+    This is a simplified implementation that removes dependencies on TensorRT-LLM and CUTLASS.
+    
     SM80 supports:
     - FP16, BF16 activations and weights
     - INT8 (UINT8) quantized weights with FP16/BF16 activations
@@ -139,52 +141,21 @@ def gen_fused_moe_sm80_module() -> JitSpec:
     - FP4/INT4 (requires SM90+ or causes compilation errors)
     - DeepSeek FP8 block scaling
     - W4A8 group scaling
+    - Tensor parallelism (simplified implementation)
+    - Min latency mode (simplified implementation)
+    
+    Note: This simplified implementation requires users to provide GEMM functions
+    (simple_moe_gemm1 and simple_moe_gemm2) or the runner will fail at runtime.
     """
     return gen_jit_spec(
         "fused_moe_sm80",
         [
-            # Core MoE GEMM kernels for SM80 - FP16/BF16/INT8 only
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
-            # FlashInfer PyTorch binding for SM80
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm80_ops.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
-            # Generated CUTLASS instantiations that provide the SM80 GEMM entry points
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_4.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_5.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_6.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_7.generated.cu",
-            # Common utilities
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
+            # Simplified MoE implementation - no TRT-LLM or CUTLASS dependencies
+            jit_env.FLASHINFER_CSRC_DIR / "fused_moe_simple/flashinfer_simple_moe_sm80_ops.cu",
         ],
         extra_cuda_cflags=[
-            "-DFLASHINFER_ENABLE_TMA_WS=0",
             "-DENABLE_BF16",
             "-DENABLE_FP16",
-            # Note: FP8 and FP4 are NOT enabled for SM80
-            "-DUSING_OSS_CUTLASS_MOE_GEMM",
             "-gencode=arch=compute_80,code=sm_80",
         ],
         extra_cflags=[
@@ -192,24 +163,7 @@ def gen_fused_moe_sm80_module() -> JitSpec:
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "cutlass_extensions"
-            / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "internal_cutlass_kernels"
-            / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "internal_cutlass_kernels",
+            jit_env.FLASHINFER_CSRC_DIR / "fused_moe_simple",
         ],
     )
 
@@ -478,7 +432,12 @@ def get_fused_moe_sm100_module():
 def get_fused_moe_sm80_module():
     module = gen_fused_moe_sm80_module().build_and_load(class_name="FusedMoeRunner")
 
-    class MoERunner(TunableRunner):
+    class MoERunner:
+        """Simplified MoE runner for SM80 without autotuning support.
+        
+        Unlike SM90+ which uses TunableRunner for performance optimization,
+        SM80 uses a simplified direct execution path without tactics or profiling.
+        """
         # avoid overhead of creating a new runner in forward pass
         _runner_dict: Dict[str, object] = dict()
 
@@ -488,47 +447,20 @@ def get_fused_moe_sm80_module():
             weight_dtype: torch.dtype,
             output_dtype: torch.dtype,
             top_k: int,
-            tp_size: int,
-            tp_rank: int,
-            ep_size: int,
-            ep_rank: int,
-            cluster_size: int,
-            cluster_rank: int,
-            use_fp8_block_scaling: bool,
-            use_w4a8_group_scaling: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
             self.output_dtype = output_dtype
             self.top_k = top_k
-            self.tp_size = tp_size
-            self.tp_rank = tp_rank
-            self.ep_size = ep_size
-            self.ep_rank = ep_rank
-            self.cluster_size = cluster_size
-            self.cluster_rank = cluster_rank
-            self.use_fp8_block_scaling = use_fp8_block_scaling
-            self.use_w4a8_group_scaling = use_w4a8_group_scaling
 
-            # SM80 does not support FP8 block scaling or W4A8 group scaling
-            if use_fp8_block_scaling:
+            # SM80 simplified implementation doesn't support advanced features
+            if weight_dtype == torch.int64:  # NVFP4
                 raise NotImplementedError(
-                    "FP8 Block Scaling is not supported on SM80 (Ampere). "
-                    "This feature requires SM89+ (Ada) or SM90+ (Hopper)."
-                )
-            if use_w4a8_group_scaling:
-                raise NotImplementedError(
-                    "W4A8 Group Scaling is not supported on SM80 (Ampere). "
+                    "NVFP4 weights are not supported on SM80 (Ampere). "
                     "This feature requires SM90+ (Hopper)."
                 )
 
-            instance_key = (
-                x_dtype,
-                weight_dtype,
-                output_dtype,
-                use_fp8_block_scaling,
-                use_w4a8_group_scaling,
-            )
+            instance_key = (x_dtype, weight_dtype, output_dtype)
 
             if instance_key not in MoERunner._runner_dict:
                 MoERunner._runner_dict[instance_key] = (
@@ -536,60 +468,9 @@ def get_fused_moe_sm80_module():
                         x_dtype,
                         weight_dtype,
                         output_dtype,
-                        use_fp8_block_scaling,
-                        use_w4a8_group_scaling,
                     )
                 )
             self._fused_moe_runner = MoERunner._runner_dict[instance_key]
-            self._is_nvfp4 = weight_dtype == torch.int64
-
-        def get_valid_tactics(
-            self,
-            inputs: List[torch.Tensor],
-        ) -> List[int]:
-            x, _, _, min_latency_mode_tensor = inputs
-            min_latency_mode = min_latency_mode_tensor.size(0) == 1
-            m = x.shape[0]
-
-            # SM80 doesn't support min_latency_mode
-            invalid = min_latency_mode or self._is_nvfp4
-
-            return (
-                [] if invalid else list(range(self._fused_moe_runner.get_tactic_num()))
-            )
-
-        def forward(
-            self,
-            inputs: List[torch.Tensor],
-            gemm_idx: int = 0,
-            tactic: int = -1,
-            do_preparation: bool = False,
-        ):
-            x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
-            min_latency_mode = min_latency_mode_tensor.size(0) == 1
-            # SM80 doesn't support min_latency_mode
-            if min_latency_mode:
-                raise NotImplementedError(
-                    "Min latency mode is not supported on SM80 (Ampere). "
-                    "This feature requires SM90+ (Hopper)."
-                )
-            
-            self._fused_moe_runner.run_gemm_profile(
-                x,
-                fc1_expert_weights,
-                fc2_expert_weights,
-                self.top_k,
-                self.tp_size,
-                self.tp_rank,
-                self.ep_size,
-                self.ep_rank,
-                self.cluster_size,
-                self.cluster_rank,
-                min_latency_mode,
-                gemm_idx,
-                tactic,
-                do_preparation,
-            )
 
     @register_custom_op(
         "flashinfer::cutlass_fused_moe_sm80",
@@ -629,60 +510,21 @@ def get_fused_moe_sm80_module():
             raise NotImplementedError(
                 "Min latency mode is not supported on SM80 (Ampere)."
             )
-
-        tuner = AutoTuner.get()
-
-        def next_positive_power_of_2(x: int) -> int:
-            if x < 1:
-                return 1
-            return 1 << (x - 1).bit_length()
-
-        tune_num_tokens_list = []
-        tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
-        while tune_num_tokens > 0:
-            tune_num_tokens_list.append(tune_num_tokens)
-            tune_num_tokens //= 2
-
-        tuning_config = TuningConfig(
-            dynamic_tensors=(
-                (0, 0, (tuple(tune_num_tokens_list), next_positive_power_of_2)),
-                (3, 0, ((0,), lambda x: x)),
+        if tp_size > 1 or ep_size > 1 or cluster_size > 1:
+            raise NotImplementedError(
+                "Tensor parallelism, expert parallelism, and cluster parallelism "
+                "are not supported in SM80 simplified implementation."
             )
-        )
 
-        min_latency_tensor = torch.empty(0)
-
+        # SM80 simplified implementation - no autotuning needed
         moe_runner = MoERunner(
             x_dtype=input.dtype,
             weight_dtype=fc1_expert_weights.dtype,
             output_dtype=output_dtype,
             top_k=token_selected_experts.size(1),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
         )
 
-        _, gemm_tactic_1 = tuner.choose_one(
-            "trtllm::fused_moe::gemm1",
-            [moe_runner],
-            tuning_config,
-            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
-            gemm_idx=1,
-        )
-
-        _, gemm_tactic_2 = tuner.choose_one(
-            "trtllm::fused_moe::gemm2",
-            [moe_runner],
-            tuning_config,
-            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
-            gemm_idx=2,
-        )
-
+        # Direct execution without autotuning
         result = moe_runner._fused_moe_runner.run_moe(
             output,
             input,
@@ -691,15 +533,6 @@ def get_fused_moe_sm80_module():
             fc1_expert_weights,
             fc2_expert_weights,
             quant_scales,
-            input_sf,
-            tp_size,
-            tp_rank,
-            ep_size,
-            ep_rank,
-            cluster_size,
-            cluster_rank,
-            min_latency_mode,
-            [gemm_tactic_1, gemm_tactic_2],
         )
 
         return [result]

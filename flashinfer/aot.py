@@ -12,7 +12,7 @@ from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
 from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
-from .fused_moe import gen_fused_moe_sm100_module
+from .fused_moe import gen_fused_moe_sm80_module, gen_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -319,6 +319,8 @@ def gen_all_modules(
     for act_name in act_func_def_str:
         jit_specs.append(gen_act_and_mul_module(act_name))
     jit_specs.append(gen_gemm_module())
+    # SM80+ fused MoE (simplified implementation)
+    jit_specs.append(gen_fused_moe_sm80_module())
     if has_sm90:
         jit_specs.append(gen_gemm_sm90_module())
     if has_sm100:

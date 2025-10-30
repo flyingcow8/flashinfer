@@ -1,49 +1,180 @@
 ```instructions
-# FlashInfer Copilot Guide (condensed)
+# FlashInfer AI Agent Guide
 
-Overview
-- Top-level API lives in `flashinfer/` and delegates heavy work to JIT/AOT compiled CUDA/C++ kernels under `csrc/` and `flashinfer/jit/`.
-- Kernel sources are frequently jinja templates (`csrc/*.jinja`) instantiated by scripts in `aot_build_utils/`.
+## Architecture Overview
+**FlashInfer** is a CUDA kernel library for LLM serving that uses JIT/AOT compilation for GPU kernels:
+- Python APIs in `flashinfer/` delegate to CUDA/C++ kernels in `csrc/` compiled on-demand
+- Most kernels are **Jinja templates** (`csrc/*.jinja`) instantiated by `aot_build_utils/generate_*.py` scripts
+- Two-stage compile: **JIT** (runtime) and **AOT** (ahead-of-time for wheels)
+- Core pattern: **plan/run split** — `plan()` precomputes schedules, `run()` executes with reusable workspaces
 
-Quick dev workflows (concrete commands)
-- Install editable: `python -m pip install --no-build-isolation -e . -v` (use `custom_backend.py` when packaging to include `3rdparty/`, `csrc/`, `include/`).
-- Run focused tests: `pytest -q tests/test_single_prefill.py` or `pytest -k decode` to limit scope.
-- Build CMake benchmarks: `mkdir build && cp cmake/config.cmake build && cd build && cmake .. && make -j` then run `bench_*` binaries in `benchmarks/`.
-- Ensure correct GPU archs for JIT: export `TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0a"` before compiling.
+### Key Components
+```
+flashinfer/           # Python API layer
+├── attention.py      # BatchAttentionWrapper - plan/run pattern
+├── decode.py         # BatchDecodeWithPagedKVCacheWrapper
+├── prefill.py        # BatchPrefillWithPagedKVCacheWrapper
+├── jit/              # JIT compilation factories (gen_* builders)
+├── comm/             # NVSHMEM distributed ops
+└── triton/           # Triton kernel alternatives
 
-Where generated modules and caches live
-- JIT/AOT caches are under `~/.cache/flashinfer/*`. Override with `FLASHINFER_WORKSPACE_BASE` for CI or container isolation.
+csrc/                 # CUDA kernel implementations
+├── *.jinja           # Templated kernels
+├── fused_moe/        # CUTLASS fused MOE (SM80/SM90+)
+└── nv_internal/      # TensorRT-LLM integration
 
-Key code patterns & locations
-- plan/run split: `flashinfer/attention.py`, `flashinfer/decode.py`, `flashinfer/prefill.py` use `plan(...)` to compute schedules and `run(...)` to reuse preallocated workspaces.
-- JIT factories: add `gen_*` builders under `flashinfer/jit/` and follow existing `build_and_load()` caching patterns.
-- Kernel generation: `aot_build_utils/` contains scripts that emit instantiation headers and .inc configs (e.g., `generate_single_prefill_inst.py`).
-- Register ops: use `flashinfer/utils.py` helpers `register_custom_op`/`register_fake_op` to keep imports working during docs builds or on older torch.
-- Distributed & NVSHMEM: `flashinfer/comm/` contains NVSHMEM bindings and helpers; generation expects `libnvshmem_host.so` and optional env vars `NVSHMEM_INCLUDE_PATH`/`NVSHMEM_LIBRARY_PATH`.
+aot_build_utils/      # Code generation scripts
+└── generate_*.py     # Emit .inc configs and headers
+```
 
-Testing & debugging notes
-- Many tests require a GPU; CUDA OOMs are intentionally downgraded to `pytest.skip` — repeated failures often indicate logic or numeric regressions.
-- Enable torch.compile warmups in tests: `FLASHINFER_TEST_TORCH_COMPILE=1` (requires torch>=2.4). See `tests/conftest.py` for caching behavior (`TORCH_COMPILE_FNS`).
-- Flush JIT/AOT caches after changing generated source: `python -c "import flashinfer.jit as j; j.clear_cache_dir()"`.
+## Developer Workflows
 
-Tooling & lint
-- Run formatting/linting: `./format.sh` (drives codespell, ruff, clang-format). Check `pyproject.toml` for ruff settings and exemptions.
+### Setup & Build
+```bash
+# Editable install (JIT mode - compiles on demand)
+python -m pip install --no-build-isolation -e . -v
 
-Concrete examples to inspect first
-- `flashinfer/attention.py` — plan/run pattern and workspace reuse
-- `csrc/batch_decode_*.jinja` + `aot_build_utils/generate_batch_paged_prefill_inst.py` — kernel generation and instantiation
-- `flashinfer/jit/env.py` — cache locations and nvshmem helpers
-- `tests/test_single_prefill.py`, `tests/conftest.py` — GPU test and torch.compile warmup examples
+# Set GPU architectures for JIT compilation
+export TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a"
 
-If you need to change or add kernels (step-by-step)
-1) Add/modify a jinja template under `csrc/` or add a generator under `aot_build_utils/`.
-2) Add a `gen_*` JitSpec factory under `flashinfer/jit/` that prepares the spec and calls the repo's `build_and_load()` style helper.
-3) Clear caches and run focused tests: `python -c "import flashinfer.jit as j; j.clear_cache_dir()" && pytest -q tests/test_single_prefill.py`.
+# Build AOT kernels (for wheel distribution)
+python -m flashinfer.aot --out-dir aot-ops --fa2-head-dim 128,128 --fa3-head-dim 128,128
+python -m build --no-isolation --wheel
 
-Files to open when investigating
-- `flashinfer/attention.py`, `flashinfer/jit/`, `aot_build_utils/`, `csrc/`, `tests/`
+# Build CMake benchmarks
+mkdir build && cp cmake/config.cmake build && cd build && cmake .. && make -j
+./bench_single_prefill --help
+```
 
-If anything is missing or one area should be expanded (AOT flow, JIT caching, NVSHMEM, packaging), tell me which and I'll extend this file.
+### Testing
+```bash
+# Run focused tests (GPU required)
+pytest -q tests/test_single_prefill.py
+pytest -k decode  # Filter by keyword
+
+# Enable torch.compile warmup (torch>=2.4)
+FLASHINFER_TEST_TORCH_COMPILE=1 pytest tests/
+
+# CUDA OOMs are auto-skipped - red tests indicate logic bugs
+```
+
+### Debugging
+```bash
+# Clear JIT/AOT caches after kernel changes
+python -c "import flashinfer.jit as jit_env; jit_env.clear_cache_dir()"
+
+# Profiler (intra-kernel timeline visualization)
+pip install protobuf git+https://github.com/flashinfer-ai/tg4perfetto.git
+python profiler/mla.py --batch-size 64 --seq-len 1024
+# View *.perfetto-trace at ui.perfetto.dev
+```
+
+### Cache Management
+- **Location**: `~/.cache/flashinfer/<arch>/` (e.g., `75_80_89_90/`)
+- **Override**: Set `FLASHINFER_WORKSPACE_BASE` for containers/CI
+- **Structure**: `cached_ops/` (JIT modules), `generated/` (sources)
+
+## Critical Coding Patterns
+
+### 1. Plan/Run Split (Attention Wrappers)
+**Why**: Amortize scheduling overhead across batches with variable-length inputs
+```python
+# flashinfer/decode.py, attention.py, prefill.py
+wrapper.plan(...)  # Compute schedule metadata once
+wrapper.run(...)   # Reuse workspace, execute kernel
+```
+**Implementation**: See `BatchDecodeWithPagedKVCacheWrapper` for threading KV indices, LSE tensors, causal flags.
+
+### 2. JIT Kernel Workflow
+**Step-by-step to add/modify kernels**:
+1. **Template**: Add/edit Jinja in `csrc/*.jinja` OR add generator in `aot_build_utils/`
+2. **Factory**: Create `gen_*` JitSpec builder in `flashinfer/jit/` (use `functools.cache` + `build_and_load()`)
+3. **Test**: Clear cache + run tests
+   ```bash
+   python -c "import flashinfer.jit as j; j.clear_cache_dir()" && pytest -q tests/test_single_prefill.py
+   ```
+
+**Example**: `flashinfer/jit/activation.py::gen_act_and_mul_module()` shows JitSpec creation pattern.
+
+### 3. Op Registration (torch.library Compatibility)
+```python
+# flashinfer/utils.py helpers for custom ops
+@register_custom_op("flashinfer::my_op", mutates_args=())
+def my_op_impl(...): ...
+
+@register_fake_op("flashinfer::my_op")
+def my_op_fake(...): ...
+```
+**Why**: Enables doc builds and older torch versions without torch.library overhead.
+
+### 4. Architecture-Specific Features
+- **Backend selection**: `flashinfer/utils.py::determine_attention_backend()`, `is_fa3_backend_supported()`
+- **SM80 (Ampere)**: CUTLASS grouped GEMM, no TMA, finalize always separate
+- **SM90+ (Hopper/Blackwell)**: TMA support, FP8/FP4 quantization, fused finalize
+- **Flags**: Mirror `sm100a_nvcc_flags` when extending Hopper/Blackwell (see `fused_moe.py`, `fp4_quantization.py`)
+
+### 5. NVSHMEM (Distributed)
+```python
+# flashinfer/comm/nvshmem.py
+from flashinfer.comm import nvshmem
+nvshmem.init()
+# ... collective ops
+torch.cuda.synchronize()
+nvshmem.finalize()
+```
+**Setup**: Requires `nvidia-nvshmem-cu12` or `NVSHMEM_INCLUDE_PATH`/`NVSHMEM_LIBRARY_PATH`.
+
+## Tooling & Code Quality
+
+### Linting & Formatting
+```bash
+./format.sh  # Auto-installs yapf 0.40.2, ruff 0.6.5, codespell 2.3.0, clang-format 15.0.7
+```
+**Ruff exemptions** (`pyproject.toml`): E402, F405, F403, E741, E501, SIM118, B019, E902, SIM102, SIM108, E731, B020, SIM103
+
+### Build System Details
+- **custom_backend.py**: PEP 517 backend that symlinks `3rdparty/`, `csrc/`, `include/` into `flashinfer/data/` for packaging
+- **Wheel modes**: 
+  - Editable: symlinks to source
+  - AOT wheel: packages pre-compiled `.so` from `aot-ops/`
+
+## File Navigation Quickstart
+
+**Starting points**:
+- `flashinfer/attention.py` - plan/run pattern & workspace reuse
+- `csrc/batch_decode_*.jinja` - kernel template example
+- `aot_build_utils/generate_batch_paged_prefill_inst.py` - code generation
+- `flashinfer/jit/env.py` - cache paths & NVSHMEM helpers
+- `tests/conftest.py` - pytest GPU setup & torch.compile warmup
+
+**Investigating issues**:
+- Backend selection → `flashinfer/utils.py`
+- Kernel instantiation → `aot_build_utils/generate_*.py`
+- JIT factories → `flashinfer/jit/*.py`
+- Test patterns → `tests/test_single_prefill.py`, `tests/test_triton_cascade.py`
+
+## Common Pitfalls
+
+1. **Cache staleness**: Always clear cache after modifying `.jinja` templates or NVCC flags
+2. **TORCH_CUDA_ARCH_LIST**: Must match target GPU or kernels won't load
+3. **OOM vs logic errors**: OOMs are skipped in tests - focus on non-OOM failures
+4. **Plan must precede run**: Wrappers require `plan()` before `run()` for workspace allocation
+5. **Comment style**: Prefer concise rationale over restating code (see `flashinfer/attention.py` buffer setups)
+
+## Performance & Profiling
+
+- **Intra-kernel profiler**: `profiler/` with perfetto trace generation (experimental, intrusive instrumentation)
+- **Benchmark suite**: CMake + nvbench in `benchmarks/` (`bench_batch_decode`, etc.)
+- **Key metrics**: SM80 shared mem 96KB, ~64 Tensor Cores/SM; GEMM+finalize <25ms typical
+
+## Integration Points
+
+**Adoption**: vLLM, SGLang, TensorRT-LLM, MLC-LLM, Hugging Face TGI
+**Bindings**: PyTorch (primary), TVM, C++ header-only
+
+---
+
+**For detailed SM80 CUTLASS MOE analysis**: See repo docs `DOCUMENT_INDEX.md`, `SM80_CUTLASS_FUSED_MOE_EXECUTION_FLOW.md`
 
 ```# FlashInfer Copilot Guide
 ## Architecture
